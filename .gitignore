@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Raw data (GitHub Archive files are large — never commit these)
+data/raw/
+*.json.gz
+*.json
+*.parquet
+
+# dbt
+dbt_packages/
+dbt/target/
+dbt/logs/
+
+# Dagster
+.dagster/
+
+# DuckDB generated databases
+*.duckdb
+*.duckdb.wal
+
+# MinIO / local object storage
+minio_data/
+
+# Soda
+.soda/
+
+# Environment variables / secrets
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
