@@ -13,8 +13,9 @@ build/
 venv/
 env/
 
-# Raw data (GitHub Archive files are large — never commit these)
+# Raw and processed data — all local artifacts, never commit
 data/raw/
+data/processed/
 *.json.gz
 *.json
 *.parquet
