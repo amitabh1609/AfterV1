@@ -124,6 +124,15 @@ ACTOR_GOLD_SCHEMA = Schema(
     NestedField(9,  "aggregated_at", TimestamptzType()),
 )
 
+QUARANTINE_SCHEMA = Schema(
+    NestedField(1, "source_file",    StringType()),
+    NestedField(2, "raw_id",         StringType()),
+    NestedField(3, "raw_type",       StringType()),
+    NestedField(4, "raw_record",     StringType()),  # full original Bronze row as JSON
+    NestedField(5, "error_reason",   StringType()),
+    NestedField(6, "quarantined_at", TimestamptzType()),
+)
+
 
 def date_partition(source_id: int) -> PartitionSpec:
     return PartitionSpec(
@@ -199,12 +208,13 @@ def save_manifest(manifest: dict):
     tmp.rename(MANIFEST_PATH)
 
 
-def mark_done(manifest, filename, bronze_rows, silver_rows):
+def mark_done(manifest, filename, bronze_rows, silver_rows, quarantine_rows=0):
     manifest[filename] = {
         "status": "done",
         "ingested_at": datetime.now(timezone.utc).isoformat(),
         "bronze_rows": bronze_rows,
         "silver_rows": silver_rows,
+        "quarantine_rows": quarantine_rows,
     }
     save_manifest(manifest)
 
@@ -269,6 +279,9 @@ def parse_to_bronze_arrow(path: Path) -> pa.Table:
                 "ingested_at": ingested_at,
             })
 
+    if not records:
+        raise RuntimeError(f"No records parsed from {path} — file may be empty or corrupted")
+
     df = pd.DataFrame(records)
     df["created_at"]  = pd.to_datetime(df["created_at"],  utc=True).dt.as_unit("us")
     df["ingested_at"] = pd.to_datetime(df["ingested_at"], utc=True).dt.as_unit("us")
@@ -309,30 +322,96 @@ def _parse_payload(row) -> dict:
     return out
 
 
-def transform_to_silver_arrow(bronze_arrow: pa.Table) -> pa.Table:
+def _is_malformed_payload(payload_str) -> bool:
+    if not isinstance(payload_str, str) or payload_str in ("{}", ""):
+        return False
+    try:
+        json.loads(payload_str)
+        return False
+    except (json.JSONDecodeError, ValueError):
+        return True
+
+
+def transform_to_silver_and_quarantine(
+    bronze_arrow: pa.Table, source_file: str
+) -> tuple[pa.Table, pa.Table, int]:
+    """
+    Splits bronze records into clean (→ Silver) and bad (→ Quarantine).
+
+    Three quarantine conditions, checked in priority order:
+      1. missing_id      — id is null or empty string
+      2. missing_type    — type is null or empty string
+      3. malformed_payload — payload string cannot be JSON-parsed
+
+    Returns (silver_arrow, quarantine_arrow, dupe_count).
+    We return dupe_count separately so the caller can include it in the
+    per-file summary log without having to re-inspect the tables.
+    """
     df = bronze_arrow.to_pandas()
+    quarantined_at = pd.Timestamp.now(tz="UTC").floor("us")
+
+    # ── Identify bad records (vectorised, no iterrows) ───────────────────────
+    missing_id       = df["id"].isna()   | (df["id"]   == "")
+    missing_type     = df["type"].isna() | (df["type"] == "")
+    malformed        = df["payload"].apply(_is_malformed_payload)
+
+    bad_mask = missing_id | missing_type | malformed
+
+    # Assign the highest-priority reason to each bad row
+    reasons = pd.Series("", index=df.index)
+    reasons[malformed]    = "malformed_payload"
+    reasons[missing_type] = "missing_type"   # overrides malformed if both
+    reasons[missing_id]   = "missing_id"     # overrides everything
+
+    # ── Build quarantine DataFrame ───────────────────────────────────────────
+    bad_df = df[bad_mask].copy()
+    quarantine_records = []
+    for _, row in bad_df.iterrows():
+        quarantine_records.append({
+            "source_file":    source_file,
+            "raw_id":         str(row.get("id", "")),
+            "raw_type":       str(row.get("type", "")),
+            "raw_record":     row.to_json(),
+            "error_reason":   reasons[row.name],
+            "quarantined_at": quarantined_at,
+        })
+
+    if quarantine_records:
+        q_df = pd.DataFrame(quarantine_records)
+        q_df["quarantined_at"] = pd.to_datetime(q_df["quarantined_at"], utc=True).dt.as_unit("us")
+        quarantine_arrow = pa.Table.from_pandas(q_df, schema=pa.schema([
+            pa.field("source_file",    pa.string()),
+            pa.field("raw_id",         pa.string()),
+            pa.field("raw_type",       pa.string()),
+            pa.field("raw_record",     pa.string()),
+            pa.field("error_reason",   pa.string()),
+            pa.field("quarantined_at", pa.timestamp("us", tz="UTC")),
+        ]), preserve_index=False)
+    else:
+        quarantine_arrow = None
+
+    # ── Clean records → Silver ───────────────────────────────────────────────
+    clean_df = df[~bad_mask].copy()
 
     # Deduplicate within this file only.
     # Cross-file duplicates cannot occur: GH Archive files are disjoint by hour.
-    before = len(df)
-    df = df.drop_duplicates(subset="id", keep="first")
-    if len(df) < before:
-        print(f"      Dropped {before - len(df):,} intra-file duplicates")
+    before = len(clean_df)
+    clean_df = clean_df.drop_duplicates(subset="id", keep="first")
+    dupe_count = before - len(clean_df)
 
     transformed_at = pd.Timestamp.now(tz="UTC").floor("us")
-    parsed = df.apply(_parse_payload, axis=1, result_type="expand")
-    df = pd.concat([df.drop(columns=["payload"]), parsed], axis=1)
+    parsed = clean_df.apply(_parse_payload, axis=1, result_type="expand")
+    clean_df = pd.concat([clean_df.drop(columns=["payload"]), parsed], axis=1)
 
-    df["event_date"]     = pd.to_datetime(df["created_at"]).dt.date
-    df["transformed_at"] = transformed_at
+    clean_df["event_date"]     = pd.to_datetime(clean_df["created_at"]).dt.date
+    clean_df["transformed_at"] = transformed_at
+    clean_df["commit_count"]   = pd.to_numeric(clean_df["commit_count"], errors="coerce").astype("Int64")
+    clean_df["pr_number"]      = pd.to_numeric(clean_df["pr_number"],    errors="coerce").astype("Int64")
+    clean_df["issue_number"]   = pd.to_numeric(clean_df["issue_number"], errors="coerce").astype("Int64")
+    clean_df["event_date"]     = pd.to_datetime(clean_df["event_date"]).dt.date
+    clean_df["transformed_at"] = pd.to_datetime(clean_df["transformed_at"], utc=True).dt.as_unit("us")
 
-    df["commit_count"] = pd.to_numeric(df["commit_count"], errors="coerce").astype("Int64")
-    df["pr_number"]    = pd.to_numeric(df["pr_number"],    errors="coerce").astype("Int64")
-    df["issue_number"] = pd.to_numeric(df["issue_number"], errors="coerce").astype("Int64")
-    df["event_date"]   = pd.to_datetime(df["event_date"]).dt.date
-    df["transformed_at"] = pd.to_datetime(df["transformed_at"], utc=True).dt.as_unit("us")
-
-    schema = pa.schema([
+    silver_arrow = pa.Table.from_pandas(clean_df, schema=pa.schema([
         pa.field("id",             pa.string()),
         pa.field("type",           pa.string()),
         pa.field("actor_login",    pa.string()),
@@ -349,8 +428,9 @@ def transform_to_silver_arrow(bronze_arrow: pa.Table) -> pa.Table:
         pa.field("issue_number",   pa.int64()),
         pa.field("ingested_at",    pa.timestamp("us", tz="UTC")),
         pa.field("transformed_at", pa.timestamp("us", tz="UTC")),
-    ])
-    return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+    ]), preserve_index=False)
+
+    return silver_arrow, quarantine_arrow, dupe_count
 
 
 # ── Gold ──────────────────────────────────────────────────────────────────────
@@ -453,7 +533,7 @@ def main():
     if args.fresh:
         print("==> --fresh: wiping all tables and manifest")
         for name in [
-            "bronze.github_events", "silver.github_events",
+            "bronze.github_events", "silver.github_events", "silver.quarantine",
             "gold.repo_daily_activity", "gold.actor_daily_activity",
         ]:
             drop_table_if_exists(catalog, name)
@@ -469,11 +549,10 @@ def main():
     ensure_namespace(catalog, "bronze")
     ensure_namespace(catalog, "silver")
 
-    # Get-or-create Bronze and Silver tables once — we'll append to them per file
-    bronze_tbl = get_or_create_table(catalog, "bronze.github_events", BRONZE_SCHEMA)
-    silver_tbl = get_or_create_table(
-        catalog, "silver.github_events", SILVER_SCHEMA, date_partition(8)
-    )
+    # Get-or-create Bronze, Silver, and Quarantine tables once — append per file
+    bronze_tbl     = get_or_create_table(catalog, "bronze.github_events", BRONZE_SCHEMA)
+    silver_tbl     = get_or_create_table(catalog, "silver.github_events", SILVER_SCHEMA, date_partition(8))
+    quarantine_tbl = get_or_create_table(catalog, "silver.quarantine",    QUARANTINE_SCHEMA)
 
     new_files = 0
     for hour in HOURS:
@@ -494,27 +573,45 @@ def main():
 
         # Step 2: Parse to Bronze Arrow table
         print(f"    Parsing ...", end=" ", flush=True)
-        bronze_arrow = parse_to_bronze_arrow(local_path)
+        try:
+            bronze_arrow = parse_to_bronze_arrow(local_path)
+        except RuntimeError as e:
+            # Corrupted file — delete it so the next run re-downloads it
+            local_path.unlink(missing_ok=True)
+            print(f"\n    ERROR: {e} — deleted local file, will retry next run")
+            continue
         print(f"{len(bronze_arrow):,} records")
 
         # Step 3: Append to Bronze Iceberg table
         bronze_tbl.append(bronze_arrow)
 
-        # Step 4: Transform Bronze → Silver (in-memory, no extra scan)
-        # We reuse the already-parsed Arrow table rather than re-reading
-        # from Iceberg, saving one round-trip to MinIO per file.
-        silver_arrow = transform_to_silver_arrow(bronze_arrow)
+        # Step 4: Transform Bronze → Silver + Quarantine (in-memory, no extra scan).
+        # We reuse the already-parsed Arrow table rather than re-reading from
+        # Iceberg, saving one round-trip to MinIO per file.
+        silver_arrow, quarantine_arrow, dupe_count = transform_to_silver_and_quarantine(
+            bronze_arrow, source_file=filename
+        )
         silver_tbl.append(silver_arrow)
+        if quarantine_arrow is not None:
+            quarantine_tbl.append(quarantine_arrow)
 
-        # Step 5: Mark done AFTER both writes succeed.
-        # If the process dies between Bronze write and this line, the next
-        # run will reprocess the file — Bronze gets a duplicate, but Silver
-        # deduplication (by event ID) will remove it on that re-run.
+        q_count = len(quarantine_arrow) if quarantine_arrow is not None else 0
+
+        # Step 5: Mark done AFTER all writes succeed.
+        # If the process dies before this line, the next run reprocesses the
+        # file — Bronze gets a duplicate, but Silver deduplication handles it.
         mark_done(manifest, filename,
                   bronze_rows=len(bronze_arrow),
-                  silver_rows=len(silver_arrow))
+                  silver_rows=len(silver_arrow),
+                  quarantine_rows=q_count)
         new_files += 1
-        print(f"    Bronze +{len(bronze_arrow):,}  Silver +{len(silver_arrow):,}  ✓ manifest updated")
+
+        # Per-file summary: processed / quarantined / duplicates
+        summary = f"    Processed: {len(silver_arrow):,}  Quarantined: {q_count}"
+        if dupe_count:
+            summary += f"  Dupes dropped: {dupe_count}"
+        summary += "  ✓ manifest updated"
+        print(summary)
 
     if new_files == 0:
         print("\n==> Nothing new to process. Run with --fresh to reprocess all files.")
@@ -523,13 +620,15 @@ def main():
     print(f"\n==> Processed {new_files} new file(s). Recomputing Gold ...")
     recompute_gold(catalog)
 
-    # Final summary
-    total_bronze = sum(v["bronze_rows"] for v in manifest.values() if v.get("status") == "done")
-    total_silver = sum(v["silver_rows"] for v in manifest.values() if v.get("status") == "done")
+    # Final summary across all files in manifest
+    total_bronze    = sum(v["bronze_rows"]    for v in manifest.values() if v.get("status") == "done")
+    total_silver    = sum(v["silver_rows"]    for v in manifest.values() if v.get("status") == "done")
+    total_quarantine = sum(v.get("quarantine_rows", 0) for v in manifest.values() if v.get("status") == "done")
     print(f"\n==> Done.")
-    print(f"    Total Bronze rows : {total_bronze:,}")
-    print(f"    Total Silver rows : {total_silver:,}")
-    print(f"    Manifest          : {MANIFEST_PATH}")
+    print(f"    Total Bronze rows    : {total_bronze:,}")
+    print(f"    Total Silver rows    : {total_silver:,}")
+    print(f"    Total Quarantined    : {total_quarantine:,}")
+    print(f"    Manifest             : {MANIFEST_PATH}")
 
 
 if __name__ == "__main__":
