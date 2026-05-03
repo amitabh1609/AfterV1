@@ -1,5 +1,5 @@
 """
-Incremental ingestion for GitHub Archive hourly files (2024-01-01, hours 0-23).
+Incremental multi-day ingestion for GitHub Archive hourly files.
 
 Design decisions:
   - Manifest (JSON file) is the source of truth for what has been processed.
@@ -26,8 +26,17 @@ Design decisions:
     script only processes files not yet in the manifest.
 
 Usage:
-    .venv/bin/python ingestion/ingest_incremental.py           # process new files
-    .venv/bin/python ingestion/ingest_incremental.py --fresh   # wipe and restart
+    # Process default 3-day window (2024-01-01 to 2024-01-03), resumable
+    .venv/bin/python ingestion/ingest_incremental.py
+
+    # Specify explicit dates
+    .venv/bin/python ingestion/ingest_incremental.py --dates 2024-01-01 2024-01-02
+
+    # Specify a date range (inclusive)
+    .venv/bin/python ingestion/ingest_incremental.py --date-range 2024-01-01 2024-01-07
+
+    # Wipe all tables and manifest, then reprocess
+    .venv/bin/python ingestion/ingest_incremental.py --fresh
 """
 
 import argparse
@@ -35,7 +44,7 @@ import gzip
 import json
 import os
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -54,7 +63,7 @@ load_dotenv()
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-DATE = "2024-01-01"
+DEFAULT_DATES = ["2024-01-01", "2024-01-02", "2024-01-03"]
 HOURS = range(24)
 
 # GH Archive drops leading zeros on hours: hour 0 → "0", hour 10 → "10"
@@ -520,13 +529,32 @@ def recompute_gold(catalog):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def resolve_dates(args) -> list[str]:
+    """Return sorted list of YYYY-MM-DD strings to process."""
+    if args.date_range:
+        start = date.fromisoformat(args.date_range[0])
+        end   = date.fromisoformat(args.date_range[1])
+        if end < start:
+            raise ValueError("--date-range end must be >= start")
+        days = (end - start).days + 1
+        return [(start + timedelta(days=i)).isoformat() for i in range(days)]
+    if args.dates:
+        return sorted(set(args.dates))
+    return DEFAULT_DATES
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--fresh", action="store_true",
-        help="Drop all Bronze/Silver/Gold tables and clear the manifest before starting"
-    )
+    parser = argparse.ArgumentParser(description="GitHub Archive incremental ingestion")
+    parser.add_argument("--fresh",      action="store_true",
+                        help="Drop all tables and manifest, then reprocess")
+    parser.add_argument("--dates",      nargs="+", metavar="DATE",
+                        help="Explicit dates to process (YYYY-MM-DD), space-separated")
+    parser.add_argument("--date-range", nargs=2,   metavar=("START", "END"),
+                        help="Inclusive date range: --date-range 2024-01-01 2024-01-07")
     args = parser.parse_args()
+
+    dates = resolve_dates(args)
+    total_files = len(dates) * len(HOURS)
 
     catalog = get_catalog()
 
@@ -541,89 +569,92 @@ def main():
             MANIFEST_PATH.unlink()
             print("    Cleared manifest")
 
-    manifest = load_manifest()
+    manifest  = load_manifest()
     done_count = sum(1 for v in manifest.values() if v.get("status") == "done")
-    print(f"\n==> Manifest: {done_count}/{len(HOURS)} hours already ingested")
+    print(f"\n==> Pipeline target  : {len(dates)} day(s) × 24 hours = {total_files} files")
+    print(f"    Dates            : {dates[0]}  →  {dates[-1]}")
+    print(f"    Already in manifest: {done_count} / {total_files} files done")
 
-    # Ensure namespaces exist before we start processing files
+    # Ensure namespaces and tables exist before the file loop
     ensure_namespace(catalog, "bronze")
     ensure_namespace(catalog, "silver")
-
-    # Get-or-create Bronze, Silver, and Quarantine tables once — append per file
     bronze_tbl     = get_or_create_table(catalog, "bronze.github_events", BRONZE_SCHEMA)
     silver_tbl     = get_or_create_table(catalog, "silver.github_events", SILVER_SCHEMA, date_partition(8))
     quarantine_tbl = get_or_create_table(catalog, "silver.quarantine",    QUARANTINE_SCHEMA)
 
     new_files = 0
-    for hour in HOURS:
-        filename = f"{DATE}-{hour}.json.gz"
-
-        if manifest.get(filename, {}).get("status") == "done":
-            print(f"\n  [{hour:02d}/23] {filename} — already ingested, skipping")
-            continue
-
-        print(f"\n  [{hour:02d}/23] {filename}")
-
-        # Step 1: Download (atomic — uses temp file internally)
-        try:
-            local_path = download_file(filename)
-        except RuntimeError as e:
-            print(f"    ERROR: {e} — skipping this hour")
-            continue
-
-        # Step 2: Parse to Bronze Arrow table
-        print(f"    Parsing ...", end=" ", flush=True)
-        try:
-            bronze_arrow = parse_to_bronze_arrow(local_path)
-        except RuntimeError as e:
-            # Corrupted file — delete it so the next run re-downloads it
-            local_path.unlink(missing_ok=True)
-            print(f"\n    ERROR: {e} — deleted local file, will retry next run")
-            continue
-        print(f"{len(bronze_arrow):,} records")
-
-        # Step 3: Append to Bronze Iceberg table
-        bronze_tbl.append(bronze_arrow)
-
-        # Step 4: Transform Bronze → Silver + Quarantine (in-memory, no extra scan).
-        # We reuse the already-parsed Arrow table rather than re-reading from
-        # Iceberg, saving one round-trip to MinIO per file.
-        silver_arrow, quarantine_arrow, dupe_count = transform_to_silver_and_quarantine(
-            bronze_arrow, source_file=filename
+    for day_idx, day in enumerate(dates):
+        day_done = sum(
+            1 for h in HOURS
+            if manifest.get(f"{day}-{h}.json.gz", {}).get("status") == "done"
         )
-        silver_tbl.append(silver_arrow)
-        if quarantine_arrow is not None:
-            quarantine_tbl.append(quarantine_arrow)
+        if day_done == len(HOURS):
+            print(f"\n── {day}  [{day_done}/24 already done, skipping]")
+            continue
 
-        q_count = len(quarantine_arrow) if quarantine_arrow is not None else 0
+        print(f"\n── {day}  [{day_done}/24 already done]")
 
-        # Step 5: Mark done AFTER all writes succeed.
-        # If the process dies before this line, the next run reprocesses the
-        # file — Bronze gets a duplicate, but Silver deduplication handles it.
-        mark_done(manifest, filename,
-                  bronze_rows=len(bronze_arrow),
-                  silver_rows=len(silver_arrow),
-                  quarantine_rows=q_count)
-        new_files += 1
+        for hour in HOURS:
+            filename = f"{day}-{hour}.json.gz"
 
-        # Per-file summary: processed / quarantined / duplicates
-        summary = f"    Processed: {len(silver_arrow):,}  Quarantined: {q_count}"
-        if dupe_count:
-            summary += f"  Dupes dropped: {dupe_count}"
-        summary += "  ✓ manifest updated"
-        print(summary)
+            if manifest.get(filename, {}).get("status") == "done":
+                continue
+
+            print(f"\n  [{hour:02d}/23] {filename}")
+
+            # Step 1: Download (atomic — uses temp file internally)
+            try:
+                local_path = download_file(filename)
+            except RuntimeError as e:
+                print(f"    ERROR: {e} — skipping this hour")
+                continue
+
+            # Step 2: Parse to Bronze Arrow table
+            print(f"    Parsing ...", end=" ", flush=True)
+            try:
+                bronze_arrow = parse_to_bronze_arrow(local_path)
+            except RuntimeError as e:
+                local_path.unlink(missing_ok=True)
+                print(f"\n    ERROR: {e} — deleted local file, will retry next run")
+                continue
+            print(f"{len(bronze_arrow):,} records")
+
+            # Step 3: Append to Bronze Iceberg table
+            bronze_tbl.append(bronze_arrow)
+
+            # Step 4: Transform Bronze → Silver + Quarantine (in-memory, no extra S3 scan)
+            silver_arrow, quarantine_arrow, dupe_count = transform_to_silver_and_quarantine(
+                bronze_arrow, source_file=filename
+            )
+            silver_tbl.append(silver_arrow)
+            if quarantine_arrow is not None:
+                quarantine_tbl.append(quarantine_arrow)
+
+            q_count = len(quarantine_arrow) if quarantine_arrow is not None else 0
+
+            # Step 5: Mark done AFTER all writes succeed
+            mark_done(manifest, filename,
+                      bronze_rows=len(bronze_arrow),
+                      silver_rows=len(silver_arrow),
+                      quarantine_rows=q_count)
+            new_files += 1
+
+            summary = f"    Processed: {len(silver_arrow):,}  Quarantined: {q_count}"
+            if dupe_count:
+                summary += f"  Dupes dropped: {dupe_count}"
+            summary += "  ✓"
+            print(summary)
 
     if new_files == 0:
         print("\n==> Nothing new to process. Run with --fresh to reprocess all files.")
         return
 
-    print(f"\n==> Processed {new_files} new file(s). Recomputing Gold ...")
+    print(f"\n==> Processed {new_files} new file(s) across {len(dates)} day(s). Recomputing Gold ...")
     recompute_gold(catalog)
 
-    # Final summary across all files in manifest
-    total_bronze    = sum(v["bronze_rows"]    for v in manifest.values() if v.get("status") == "done")
-    total_silver    = sum(v["silver_rows"]    for v in manifest.values() if v.get("status") == "done")
-    total_quarantine = sum(v.get("quarantine_rows", 0) for v in manifest.values() if v.get("status") == "done")
+    total_bronze     = sum(v["bronze_rows"]              for v in manifest.values() if v.get("status") == "done")
+    total_silver     = sum(v["silver_rows"]              for v in manifest.values() if v.get("status") == "done")
+    total_quarantine = sum(v.get("quarantine_rows", 0)   for v in manifest.values() if v.get("status") == "done")
     print(f"\n==> Done.")
     print(f"    Total Bronze rows    : {total_bronze:,}")
     print(f"    Total Silver rows    : {total_silver:,}")
