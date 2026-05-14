@@ -1,0 +1,73 @@
+# Soda Core checks for bronze.github_events
+# Table is loaded from Iceberg into DuckDB as 'bronze_events' before checks run.
+# Column names match the actual Bronze Iceberg schema.
+
+checks for bronze_events:
+
+  # ── Completeness ───────────────────────────────────────────────────────────
+
+  - row_count > 0:
+      name: bronze has rows
+
+  - missing_count(id) = 0:
+      name: event id not null
+      missing values: ['', 'null', 'None']
+
+  - missing_count(type) = 0:
+      name: event type not null
+      missing values: ['', 'null', 'None']
+
+  - missing_count(actor_login) = 0:
+      name: actor login not null
+
+  - missing_count(actor_id) = 0:
+      name: actor id not null
+
+  - missing_count(repo_name) = 0:
+      name: repo name not null
+
+  - missing_count(repo_id) = 0:
+      name: repo id not null
+
+  - missing_count(created_at) = 0:
+      name: created_at not null
+
+  - missing_count(payload) = 0:
+      name: payload not null
+
+  # ── Uniqueness ─────────────────────────────────────────────────────────────
+
+  - duplicate_count(id) = 0:
+      name: event id unique in bronze
+
+  # ── Validity ───────────────────────────────────────────────────────────────
+
+  - invalid_count(type) = 0:
+      name: event type only known values
+      valid values:
+        - PushEvent
+        - PullRequestEvent
+        - PullRequestReviewEvent
+        - PullRequestReviewCommentEvent
+        - IssuesEvent
+        - IssueCommentEvent
+        - WatchEvent
+        - ForkEvent
+        - CreateEvent
+        - DeleteEvent
+        - ReleaseEvent
+        - MemberEvent
+        - CommitCommentEvent
+        - GollumEvent
+        - PublicEvent
+
+  - min(length(id)) > 0:
+      name: event id not empty string
+
+  - failed rows:
+      name: created_at within expected year
+      fail condition: YEAR(created_at) NOT IN (2024)
+
+  - failed rows:
+      name: no future events in bronze
+      fail condition: created_at > ingested_at

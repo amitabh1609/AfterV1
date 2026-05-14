@@ -1,0 +1,78 @@
+# Soda Core checks for silver.github_events
+# Table is loaded from Iceberg into DuckDB as 'silver_events' before checks run.
+# Column names match the actual Silver Iceberg schema.
+
+checks for silver_events:
+
+  # ── Completeness ───────────────────────────────────────────────────────────
+
+  - row_count > 0:
+      name: silver has rows
+
+  - missing_count(id) = 0:
+      name: event id not null after dedup
+      missing values: ['', 'null', 'None']
+
+  - missing_count(type) = 0:
+      name: event type not null in silver
+
+  - missing_count(actor_login) = 0:
+      name: actor login not null in silver
+
+  - missing_count(actor_id) = 0:
+      name: actor id not null in silver
+
+  - missing_count(repo_name) = 0:
+      name: repo name not null in silver
+
+  - missing_count(repo_id) = 0:
+      name: repo id not null in silver
+
+  - missing_count(event_date) = 0:
+      name: event_date populated for all rows
+
+  # ── Uniqueness ─────────────────────────────────────────────────────────────
+
+  - duplicate_count(id) = 0:
+      name: no duplicate event ids after deduplication
+
+  # ── Validity ───────────────────────────────────────────────────────────────
+
+  - invalid_count(type) = 0:
+      name: silver event type only known values
+      valid values:
+        - PushEvent
+        - PullRequestEvent
+        - PullRequestReviewEvent
+        - PullRequestReviewCommentEvent
+        - IssuesEvent
+        - IssueCommentEvent
+        - WatchEvent
+        - ForkEvent
+        - CreateEvent
+        - DeleteEvent
+        - ReleaseEvent
+        - MemberEvent
+        - CommitCommentEvent
+        - GollumEvent
+        - PublicEvent
+
+  - failed rows:
+      name: created_at within expected date range
+      fail condition: event_date < '2024-01-01' OR event_date > '2024-01-07'
+
+  - failed rows:
+      name: no future events in silver
+      fail condition: created_at > transformed_at
+
+  - failed rows:
+      name: late arriving events flagged
+      warn condition: >
+        CAST(transformed_at AS BIGINT) - CAST(created_at AS BIGINT) > 86400000000
+
+  # ── Freshness ──────────────────────────────────────────────────────────────
+
+  - freshness(ingested_at) < 2d:
+      name: silver data not stale
+      warn: when > 1d
+      fail: when > 2d

@@ -9,3 +9,4 @@ streamlit==1.57.0
 plotly==6.7.0
 dagster==1.9.13
 dagster-webserver==1.9.13
+soda-core-duckdb==3.5.6

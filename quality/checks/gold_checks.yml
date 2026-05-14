@@ -1,0 +1,74 @@
+# Soda Core checks for gold layer
+# Tables loaded from Iceberg into DuckDB as 'gold_repo' and 'gold_actor'.
+
+checks for gold_repo:
+
+  # ── Completeness ───────────────────────────────────────────────────────────
+
+  - row_count > 0:
+      name: gold repo activity has rows
+
+  - missing_count(repo_name) = 0:
+      name: repo name not null in gold
+
+  - missing_count(event_date) = 0:
+      name: event date not null in gold repo
+
+  - missing_count(total_events) = 0:
+      name: total events not null
+
+  # ── Validity ───────────────────────────────────────────────────────────────
+
+  - min(total_events) >= 0:
+      name: total events not negative
+
+  - min(push_count) >= 0:
+      name: push count not negative
+
+  - min(stars) >= 0:
+      name: star count not negative
+
+  - min(forks) >= 0:
+      name: fork count not negative
+
+  - min(unique_contributors) >= 1:
+      name: at least one contributor per repo-day
+
+  - failed rows:
+      name: event date within expected range
+      fail condition: event_date < '2024-01-01' OR event_date > '2024-01-07'
+
+  - duplicate_count(repo_name, event_date) = 0:
+      name: one row per repo per date
+
+
+checks for gold_actor:
+
+  # ── Completeness ───────────────────────────────────────────────────────────
+
+  - row_count > 0:
+      name: gold actor activity has rows
+
+  - missing_count(actor_login) = 0:
+      name: actor login not null in gold
+
+  - missing_count(event_date) = 0:
+      name: event date not null in gold actor
+
+  # ── Validity ───────────────────────────────────────────────────────────────
+
+  - min(total_events) >= 0:
+      name: actor total events not negative
+
+  - min(push_count) >= 0:
+      name: actor push count not negative
+
+  - min(repos_touched) >= 1:
+      name: actor touched at least one repo
+
+  - duplicate_count(actor_login, event_date) = 0:
+      name: one row per actor per date
+
+  - failed rows:
+      name: actor event date within expected range
+      fail condition: event_date < '2024-01-01' OR event_date > '2024-01-07'

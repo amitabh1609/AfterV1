@@ -5,12 +5,15 @@ Run: .venv/bin/streamlit run dashboard/app.py
 
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import s3fs
 import streamlit as st
 from dotenv import load_dotenv
 from pyiceberg.catalog.sql import SqlCatalog
@@ -219,7 +222,7 @@ with st.sidebar:
 
     page = st.radio(
         "Navigate",
-        ["🏠  Overview", "📊  Analytics", "🔍  Explorer", "🚨  Quarantine"],
+        ["🏠  Overview", "📊  Analytics", "🔍  Explorer", "🚨  Quarantine", "💰  FinOps"],
         label_visibility="collapsed",
     )
 
@@ -520,6 +523,205 @@ elif "Quarantine" in page:
                 st.plotly_chart(fig_q, use_container_width=True)
 
         st.dataframe(quarantine, use_container_width=True, height=400, hide_index=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: FINOPS & OBSERVABILITY
+# ══════════════════════════════════════════════════════════════════════════════
+
+elif "FinOps" in page:
+
+    S3_PER_GB_MONTH = 0.023   # AWS S3 Standard price per GB/month
+
+    def get_s3fs():
+        return s3fs.S3FileSystem(
+            key=os.getenv("S3_ACCESS_KEY", "minio"),
+            secret=os.getenv("S3_SECRET_KEY", "minio123"),
+            endpoint_url=os.getenv("S3_ENDPOINT", "http://localhost:9000"),
+            use_ssl=False,
+        )
+
+    st.markdown('<div class="section-title">💰 FinOps & Observability</div>', unsafe_allow_html=True)
+
+    # ── 1. Storage Cost Estimate ───────────────────────────────────────────────
+    st.markdown("#### Storage Cost Estimate")
+    st.caption("Reads actual Parquet file sizes from MinIO and estimates equivalent AWS S3 Standard cost at $0.023/GB/month.")
+
+    try:
+        fs   = get_s3fs()
+        bucket = os.getenv("S3_BUCKET", "lakehouse")
+
+        table_paths = {
+            "bronze.github_events":      f"{bucket}/bronze.db/github_events/data/",
+            "silver.github_events":      f"{bucket}/silver.db/github_events/data/",
+            "silver.quarantine":         f"{bucket}/silver.db/quarantine/data/",
+            "gold.repo_daily_activity":  f"{bucket}/gold.db/repo_daily_activity/data/",
+            "gold.actor_daily_activity": f"{bucket}/gold.db/actor_daily_activity/data/",
+        }
+
+        storage_rows = []
+        for tbl_name, path in table_paths.items():
+            try:
+                files      = fs.find(path)
+                total_bytes = sum(fs.info(f)["size"] for f in files if f.endswith(".parquet"))
+                size_mb    = total_bytes / 1_048_576
+                size_gb    = total_bytes / 1_073_741_824
+                cost_month = size_gb * S3_PER_GB_MONTH
+                storage_rows.append({
+                    "Table":                  tbl_name,
+                    "Parquet Files":          len([f for f in files if f.endswith(".parquet")]),
+                    "Size (MB)":              f"{size_mb:.1f}",
+                    "Est. Monthly S3 Cost":   f"${cost_month:.4f}",
+                })
+            except Exception:
+                storage_rows.append({"Table": tbl_name, "Parquet Files": "—", "Size (MB)": "—", "Est. Monthly S3 Cost": "—"})
+
+        st.dataframe(pd.DataFrame(storage_rows), use_container_width=True, hide_index=True)
+
+        total_mb = sum(
+            float(r["Size (MB)"]) for r in storage_rows if r["Size (MB)"] != "—"
+        )
+        total_cost = total_mb / 1024 * S3_PER_GB_MONTH
+        col_s1, col_s2 = st.columns(2)
+        col_s1.metric("Total Data Size", f"{total_mb:.0f} MB")
+        col_s2.metric("Total Est. Monthly Cost", f"${total_cost:.4f}")
+
+    except Exception as e:
+        st.warning(f"MinIO not reachable — start MinIO to see storage costs. ({e})")
+
+    st.divider()
+
+    # ── 2. Query Cost Comparison ───────────────────────────────────────────────
+    st.markdown("#### Query Cost: Full Scan vs Partition Filter")
+    st.caption("Runs the same aggregation two ways and measures wall-clock time.")
+
+    if not silver.empty:
+        con = duckdb.connect()
+        con.register("silver", silver)
+
+        if st.button("▶  Run Timing Benchmark"):
+            with st.spinner("Running full scan ..."):
+                t0 = time.perf_counter()
+                con.execute("SELECT type, COUNT(*) FROM silver GROUP BY type").df()
+                full_ms = (time.perf_counter() - t0) * 1000
+
+            with st.spinner("Running partition-filtered scan ..."):
+                t1 = time.perf_counter()
+                con.execute(
+                    "SELECT type, COUNT(*) FROM silver WHERE event_date = '2024-01-01' GROUP BY type"
+                ).df()
+                part_ms = (time.perf_counter() - t1) * 1000
+
+            con.close()
+            saved_ms  = full_ms - part_ms
+            pct_saved = (saved_ms / full_ms * 100) if full_ms > 0 else 0
+
+            timing_df = pd.DataFrame([{
+                "Query":      "Full Table Scan",
+                "Time (ms)":  f"{full_ms:.1f}",
+                "Rows Scanned": f"{len(silver):,}",
+            }, {
+                "Query":      "Partition Filter (2024-01-01 only)",
+                "Time (ms)":  f"{part_ms:.1f}",
+                "Rows Scanned": f"{len(silver[silver['event_date'].astype(str) == '2024-01-01']):,}",
+            }])
+            st.dataframe(timing_df, use_container_width=True, hide_index=True)
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Full Scan",         f"{full_ms:.0f} ms")
+            c2.metric("Partition Filter",  f"{part_ms:.0f} ms")
+            c3.metric("Time Saved",        f"{saved_ms:.0f} ms", delta=f"{pct_saved:.0f}% faster")
+        else:
+            st.info("Click the button above to run the timing benchmark.")
+    else:
+        st.warning("No Silver data loaded — run the ingestion pipeline first.")
+
+    st.divider()
+
+    # ── 3. Snapshot Growth Tracking ───────────────────────────────────────────
+    st.markdown("#### Iceberg Snapshot Growth")
+    st.caption("Each hourly append creates one snapshot. More than 10 snapshots signals that expiry should be configured.")
+
+    try:
+        catalog = get_catalog()
+        snap_rows = []
+        for tbl_name in ["silver.github_events", "bronze.github_events"]:
+            try:
+                tbl   = catalog.load_table(tbl_name)
+                snaps = tbl.metadata.snapshots
+                n     = len(snaps)
+                total = int(snaps[-1].summary.additional_properties.get("total-records", 0)) if snaps else 0
+                ts    = snaps[-1].timestamp_ms / 1000 if snaps else 0
+                snap_rows.append({
+                    "Table":         tbl_name,
+                    "Snapshots":     n,
+                    "Current Rows":  f"{total:,}",
+                    "Latest At":     datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC") if ts else "—",
+                    "⚠ Needs Expiry": "Yes — configure snapshot expiry" if n > 10 else "No",
+                })
+            except Exception:
+                snap_rows.append({"Table": tbl_name, "Snapshots": "—", "Current Rows": "—", "Latest At": "—", "⚠ Needs Expiry": "—"})
+
+        snap_df = pd.DataFrame(snap_rows)
+        st.dataframe(snap_df, use_container_width=True, hide_index=True)
+
+        for r in snap_rows:
+            if str(r.get("Snapshots", 0)).isdigit() and int(r["Snapshots"]) > 10:
+                st.warning(f"⚠ `{r['Table']}` has {r['Snapshots']} snapshots — consider running snapshot expiry to reclaim metadata storage.")
+
+    except Exception as e:
+        st.warning(f"Could not load Iceberg metadata. ({e})")
+
+    st.divider()
+
+    # ── 4. Pipeline Freshness ─────────────────────────────────────────────────
+    st.markdown("#### Pipeline Freshness")
+    st.caption("Time since last successful ingestion per date partition. Green < 24 h · Yellow 24–48 h · Red > 48 h")
+
+    if manifest:
+        now_utc   = datetime.now(timezone.utc)
+        fresh_rows = []
+        days_seen  = set()
+
+        for fname, entry in sorted(manifest.items()):
+            if entry.get("status") != "done":
+                continue
+            day = fname[:10]
+            if day in days_seen:
+                continue
+            days_seen.add(day)
+
+            last_ts_str = max(
+                v["ingested_at"] for k, v in manifest.items()
+                if k.startswith(day) and v.get("status") == "done"
+            )
+            last_ts   = datetime.fromisoformat(last_ts_str)
+            hours_ago = (now_utc - last_ts).total_seconds() / 3600
+            files_done = sum(1 for k, v in manifest.items()
+                             if k.startswith(day) and v.get("status") == "done")
+
+            if hours_ago < 24:
+                pill = "<span class='pill-green'>Fresh</span>"
+            elif hours_ago < 48:
+                pill = "<span class='pill-yellow'>Stale</span>"
+            else:
+                pill = "<span class='pill-red'>Old</span>"
+
+            fresh_rows.append({
+                "Date":          day,
+                "Files Done":    f"{files_done}/24",
+                "Last Ingested": last_ts_str[:19].replace("T", " ") + " UTC",
+                "Hours Ago":     f"{hours_ago:.0f} h",
+                "Status":        pill,
+            })
+
+        if fresh_rows:
+            df_fresh = pd.DataFrame(fresh_rows)
+            st.markdown(df_fresh.to_html(escape=False, index=False), unsafe_allow_html=True)
+        else:
+            st.info("No completed ingestions in manifest yet.")
+    else:
+        st.info("Manifest not found — run the ingestion pipeline first.")
 
 
 # ── Footer ────────────────────────────────────────────────────────────────────
